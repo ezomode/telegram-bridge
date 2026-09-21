@@ -275,7 +275,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(send_outbox, interval=2.0, first=2.0)
 
-    log("bridge poller started")
+    log(f"bridge poller started (pid {os.getpid()})")
     # run_polling can die on transient network blips (flaky egress proxy);
     # retry with backoff instead of exiting so the poller survives them.
     # Catch BaseException: asyncio.CancelledError (raised during network
@@ -291,6 +291,11 @@ def main():
             log(f"run_polling crashed: {type(e).__name__}: {e}; retrying in {delay}s")
             time.sleep(delay)
             delay = min(delay * 2, 120)
+    # PTB handles SIGTERM/SIGINT with a graceful shutdown: run_polling then
+    # returns normally and we land here. Log it so a silent death with this
+    # line means "killed by signal", while a silent death WITHOUT it means
+    # SIGKILL/OOM/os._exit (the retry loop above already logs every crash).
+    log("poller exiting.")
 
 
 if __name__ == "__main__":
