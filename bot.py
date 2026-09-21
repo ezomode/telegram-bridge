@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,25 @@ INBOX = HERE / "queue" / "inbox"
 OUTBOX = HERE / "queue" / "outbox"
 DONE = HERE / "queue" / "done"
 FAILED = HERE / "queue" / "failed"
+PIDFILE = HERE / "bot.pid"
+
+
+def already_running():
+    """True if bot.pid points at a live process running this script.
+
+    Makes duplicate starts (overlapping ticks, stale runbooks) exit
+    immediately instead of stealing getUpdates and causing Conflict storms.
+    """
+    try:
+        pid = int(PIDFILE.read_text().strip().split()[0])
+    except (OSError, ValueError):
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode(errors="replace").replace("\x00", " ")
+    except OSError:
+        return False  # no such process (stale pidfile)
+    return "telegram-bot-bridge/bot/bot.py" in cmdline
 OWNER_FILE = HERE / "owner.json"
 
 for d in (INBOX, OUTBOX, DONE, FAILED):
@@ -229,6 +249,10 @@ def main():
     if not TOKEN:
         log("TELEGRAM_BOT_TOKEN missing in .env — exiting.")
         sys.exit(2)
+    if already_running():
+        log("another poller already running (bot.pid) — exiting.")
+        return
+    PIDFILE.write_text(str(os.getpid()))
     from telegram.ext import (
         ApplicationBuilder, CommandHandler, MessageHandler, filters,
     )
@@ -252,7 +276,21 @@ def main():
     app.job_queue.run_repeating(send_outbox, interval=2.0, first=2.0)
 
     log("bridge poller started")
-    app.run_polling(drop_pending_updates=True, bootstrap_retries=5)
+    # run_polling can die on transient network blips (flaky egress proxy);
+    # retry with backoff instead of exiting so the poller survives them.
+    # Catch BaseException: asyncio.CancelledError (raised during network
+    # failure cascades) inherits BaseException, not Exception.
+    delay = 5
+    while True:
+        try:
+            app.run_polling(drop_pending_updates=True, bootstrap_retries=5)
+            break  # clean shutdown
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except BaseException as e:
+            log(f"run_polling crashed: {type(e).__name__}: {e}; retrying in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
 
 
 if __name__ == "__main__":
